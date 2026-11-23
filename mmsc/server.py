@@ -85,6 +85,7 @@ class Mmsc:
             timer.cancel()
         for task in self._tasks:
             task.cancel()
+        await asyncio.gather(*self._tasks, return_exceptions=True)
         if self._server:
             self._server.close()
             await self._server.wait_closed()
@@ -240,7 +241,6 @@ class Mmsc:
             task = asyncio.get_running_loop().create_task(self._send_sms(target, pdus, headers, number))
             self._tasks.add(task)
             task.add_done_callback(self._tasks.discard)
-            self.log(f"{headers['Message-Type']} -> {number} in {len(pdus)} SMS")
         else:
             self._udp.sendto(push, (target.ip, target.port))
             self.log(f"{headers['Message-Type']} -> {number}")
@@ -255,6 +255,8 @@ class Mmsc:
                 await writer.wait_closed()
         except OSError as exc:
             self.log(f"Cannot send {headers['Message-Type']} to {number} by SMS: {exc}")
+        else:
+            self.log(f"{headers['Message-Type']} -> {number} in {len(pdus)} SMS")
 
     def _number_at(self, ip: str) -> str:
         """Identify a phone by its IP, as the original did when From is insert-address."""

@@ -64,15 +64,21 @@ def decode_sms(text: str) -> Segment:
         pos += 2 + 7  # protocol identifier, coding scheme, timestamp
         user_data = pdu[pos + 1 : pos + 1 + pdu[pos]]
         udh, data = user_data[1 : 1 + user_data[0]], user_data[1 + user_data[0] :]
+        if len(user_data) != pdu[pos] or len(udh) != user_data[0]:
+            raise IndexError
         elements, i = {}, 0
         while i < len(udh):
             elements[udh[i]] = udh[i + 2 : i + 2 + udh[i + 1]]
             i += 2 + udh[i + 1]
+        if i != len(udh):
+            raise IndexError
         if elements.get(0x05, b"")[:2] != PUSH_PORT.to_bytes(2, "big"):
             raise PduError("SMS is not addressed to the WAP push port")
         concat = elements.get(_CONCAT_IE)
-        if concat:
-            return Segment(int.from_bytes(concat[:2], "big"), concat[2], concat[3], data)
-        return Segment(0, 1, 1, data)
+        segment = Segment(int.from_bytes(concat[:2], "big"), concat[2], concat[3], data) if concat \
+            else Segment(0, 1, 1, data)
     except IndexError as exc:
         raise PduError("truncated SMS PDU") from exc
+    if not 1 <= segment.number <= segment.count:
+        raise PduError(f"SMS segment {segment.number} of {segment.count}")
+    return segment

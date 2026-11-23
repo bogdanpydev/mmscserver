@@ -116,12 +116,17 @@ class Phone:
 
     async def _on_sms(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         """One SMS PDU per connection, as hex text; a push split over several SMS is put back together."""
-        text = (await reader.read()).decode("ascii", "replace")
-        writer.close()
         try:
+            async with asyncio.timeout(minihttp.TIMEOUT):
+                text = (await reader.read()).decode("ascii", "replace")
             segment = decode_sms(text)
-        except PduError as exc:
-            self.log(f"Bad SMS: {exc}")
+        except (TimeoutError, PduError) as exc:
+            self.log(f"Bad SMS: {str(exc) or 'timed out'}")
+            return
+        finally:
+            writer.close()
+        if segment.count == 1:
+            self._on_push(segment.data)
             return
         received = self._segments.setdefault(segment.reference, {})
         received[segment.number] = segment.data

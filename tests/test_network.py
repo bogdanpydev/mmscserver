@@ -364,22 +364,36 @@ def test_sms_that_cannot_be_delivered_is_logged():
     asyncio.run(scenario())
 
 
-def test_phone_logs_bad_sms():
-    not_for_wap = encode_sms(b"push", 1)[0].replace("0B84", "0B85")  # destination port 2949
-    stray_segment = encode_sms(bytes(200), 7)[0]  # first of two; the second never comes
+def test_phone_logs_bad_sms(monkeypatch):
+    monkeypatch.setattr(minihttp, "TIMEOUT", 0.1)
+    good = encode_sms(b"push", 1)[0]
+    first_of_two = encode_sms(bytes(200), 7)[0]
+    cases = {
+        "zz": "SMS PDU is not hex text",
+        "00": "truncated SMS PDU",
+        "0001": "not an SMS-DELIVER with a user data header",
+        good[:-2]: "truncated SMS PDU",  # shorter than its user data length
+        good.replace("060504", "060506", 1): "truncated SMS PDU",  # header element longer than the header
+        good.replace("0B84", "0B85"): "SMS is not addressed to the WAP push port",  # port 2949
+        first_of_two.replace("0804000702", "0804000700"): "SMS segment 1 of 0",
+        None: "timed out",  # connects and sends nothing
+    }
 
     async def scenario():
         async with network("200", transport="sms") as (_, phones, logs):
-            for text in ("zz", "00", "0001", not_for_wap, stray_segment):
-                _, writer = await asyncio.open_connection("127.0.0.1", phones["200"].port)
-                writer.write(text.encode())
-                writer.close()
-                await writer.wait_closed()
             bad = lambda: [line.removeprefix("Bad SMS: ") for line in logs if line.startswith("Bad SMS")]  # noqa: E731
-            await eventually(lambda: len(bad()) == 4)
-            assert bad()[0].startswith("SMS PDU is not hex text")
-            assert bad()[1:] == ["truncated SMS PDU", "not an SMS-DELIVER with a user data header",
-                                 "SMS is not addressed to the WAP push port"]
+            for count, (text, error) in enumerate(cases.items(), 1):
+                _, writer = await asyncio.open_connection("127.0.0.1", phones["200"].port)
+                if text is not None:
+                    writer.write(text.encode())
+                    writer.close()
+                await eventually(lambda: len(bad()) == count)
+                assert bad()[-1].startswith(error)
+                writer.close()
+            _, writer = await asyncio.open_connection("127.0.0.1", phones["200"].port)
+            writer.write(first_of_two.encode())  # the second segment never comes
+            writer.close()
+            await asyncio.sleep(0.05)
             assert phones["200"].reports == [] and phones["200"].inbox == []
 
     asyncio.run(scenario())
