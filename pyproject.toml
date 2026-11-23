@@ -1,0 +1,12 @@
+[project]
+name = "mmsc"
+version = "0.1.0"
+description = "MMSC simulator: an MMS relay/server and simulated phones (OMA MMS over WAP)"
+requires-python = ">=3.12"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.coverage.run]
+source = ["mmsc"]
