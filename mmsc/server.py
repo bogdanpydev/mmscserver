@@ -1,16 +1,26 @@
-"""The MMSC: accepts MM1 requests over HTTP and notifies phones with WAP push over UDP."""
+"""The MMSC: accepts MM1 requests over HTTP and notifies phones with WAP push over UDP or SMS."""
 
 import asyncio
 import itertools
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import NamedTuple
 
 from . import minihttp
 from .pdu import Pdu, PduError, decode, encode, number_of, plmn, push_wrap
+from .sms import encode_sms
 
 REQUEST_TYPES = ("m-send-req", "m-notifyresp-ind", "m-acknowledge-ind", "m-read-rec-ind")
 COPIED_TO_RECIPIENT = ("To", "Cc", "Subject", "Message-Class", "Priority", "Delivery-Report", "Read-Report")
+
+
+class Target(NamedTuple):
+    """Where a phone receives pushes."""
+
+    ip: str
+    port: int
+    transport: str = "udp"  # "udp": WAP push datagrams; "sms": SMS PDUs over TCP, one connection each
 
 
 @dataclass
@@ -22,7 +32,7 @@ class Config:
     expiry: int = 2 * 24 * 3600
     mms_version: str = "1.2"
     manual: bool = False  # hold notifications until send_held(), like the original's manual mode
-    phones: dict[str, tuple[str, int]] = field(default_factory=dict)  # number -> (ip, push port)
+    phones: dict[str, Target] = field(default_factory=dict)  # by number
 
 
 @dataclass
@@ -51,7 +61,9 @@ class Mmsc:
         self._deliveries: dict[str, tuple[Message, Delivery]] = {}  # by transaction id
         self.held: dict[str, dict] = {}  # notification headers waiting in manual mode, by transaction id
         self._ids = itertools.count(1)
+        self._sms_references = itertools.count(1)
         self._timers: list[asyncio.TimerHandle] = []
+        self._tasks: set[asyncio.Task] = set()
         self._server: asyncio.Server | None = None
         self._udp: asyncio.DatagramTransport | None = None
 
@@ -71,6 +83,9 @@ class Mmsc:
     async def stop(self) -> None:
         for timer in self._timers:
             timer.cancel()
+        for task in self._tasks:
+            task.cancel()
+        await asyncio.gather(*self._tasks, return_exceptions=True)
         if self._server:
             self._server.close()
             await self._server.wait_closed()
@@ -220,9 +235,29 @@ class Mmsc:
         if target is None:
             self.log(f"Cannot push {headers['Message-Type']}: {number} is not in the phone list")
             return
-        self._udp.sendto(push_wrap(encode(Pdu(headers))), target)
-        self.log(f"{headers['Message-Type']} -> {number}")
+        push = push_wrap(encode(Pdu(headers)))
+        if target.transport == "sms":
+            pdus = encode_sms(push, next(self._sms_references))
+            task = asyncio.get_running_loop().create_task(self._send_sms(target, pdus, headers, number))
+            self._tasks.add(task)
+            task.add_done_callback(self._tasks.discard)
+        else:
+            self._udp.sendto(push, (target.ip, target.port))
+            self.log(f"{headers['Message-Type']} -> {number}")
+
+    async def _send_sms(self, target: Target, pdus: list[str], headers: dict, number: str) -> None:
+        """Deliver each SMS PDU on its own TCP connection, as the original did."""
+        try:
+            for pdu in pdus:
+                _, writer = await asyncio.open_connection(target.ip, target.port)
+                writer.write(pdu.encode())
+                writer.close()
+                await writer.wait_closed()
+        except OSError as exc:
+            self.log(f"Cannot send {headers['Message-Type']} to {number} by SMS: {exc}")
+        else:
+            self.log(f"{headers['Message-Type']} -> {number} in {len(pdus)} SMS")
 
     def _number_at(self, ip: str) -> str:
         """Identify a phone by its IP, as the original did when From is insert-address."""
-        return next((number for number, (host, _) in self.config.phones.items() if host == ip), "unknown")
+        return next((number for number, target in self.config.phones.items() if target.ip == ip), "unknown")

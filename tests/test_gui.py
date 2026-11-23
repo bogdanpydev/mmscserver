@@ -194,8 +194,20 @@ def test_real_phones_are_added_saved_and_removed(app, tmp_path):
     app.new_number.set("300")
     app.new_ip.set("10.0.0.3")
     app.add_external_phone()
-    assert rows(app.directory) == [("300", "10.0.0.3", "2948", "real")]
-    assert json.loads((tmp_path / "mmsc.json").read_text())["phones"] == {"300": ["10.0.0.3", 2948]}
+    app.new_number.set("301")
+    app.new_ip.set("10.0.0.4")
+    app.new_transport.set("sms")
+    app.transport_changed()
+    assert app.new_port.get() == "2950"
+    app.add_external_phone()
+    assert rows(app.directory) == [("300", "10.0.0.3", "2948", "udp", "real"),
+                                   ("301", "10.0.0.4", "2950", "sms", "real")]
+    assert json.loads((tmp_path / "mmsc.json").read_text())["phones"] == {
+        "300": ["10.0.0.3", 2948, "udp"], "301": ["10.0.0.4", 2950, "sms"]}
+    app.directory.selection_set("301")
+    app.remove_selected()
+    app.new_transport.set("udp")
+    app.new_number.set("300")
 
     app.add_external_phone()
     app.new_number.set("")
@@ -215,8 +227,8 @@ def test_real_phones_are_added_saved_and_removed(app, tmp_path):
 def test_simulated_phones_are_not_saved_and_can_be_removed(app, tmp_path):
     add_phone(app, "100")
     second = add_phone(app, "200")
-    assert rows(app.directory) == [("100", "127.0.0.1", str(app.config.phones["100"][1]), "simulated"),
-                                   ("200", "127.0.0.1", str(app.config.phones["200"][1]), "simulated")]
+    assert rows(app.directory) == [("100", "127.0.0.1", str(app.config.phones["100"].port), "udp", "simulated"),
+                                   ("200", "127.0.0.1", str(app.config.phones["200"].port), "udp", "simulated")]
     app.save()
     assert json.loads((tmp_path / "mmsc.json").read_text())["phones"] == {}
 
@@ -225,6 +237,20 @@ def test_simulated_phones_are_not_saved_and_can_be_removed(app, tmp_path):
     second.close()
     assert app.config.phones == {}
     assert app.phones == {}
+
+
+def test_simulated_phone_can_be_notified_by_sms(app):
+    start(app)
+    sender = add_phone(app, "100")
+    app.new_transport.set("sms")
+    receiver = add_phone(app, "200")
+    assert rows(app.directory)[1][3:] == ("sms", "simulated")
+    pump(app, lambda: "[200] Simulated phone waiting for SMS on TCP port" in log_text(app))
+    sender.to.set("200")
+    sender.text.insert("1.0", "prin SMS")
+    sender.send()
+    pump(app, lambda: receiver.inbox.get_children())
+    assert "m-notification-ind -> 200 in 1 SMS" in log_text(app)
 
 
 def test_settings_are_saved_at_start_and_loaded_next_time(app, tmp_path):

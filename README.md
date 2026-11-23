@@ -8,10 +8,10 @@ It started as a bachelor's thesis project idea. The original was written in 2008
 
 - Speaks the MM1 interface (OMA MMS Encapsulation 1.0–1.3):
   - phones POST `m-send.req` over HTTP and get `m-send.conf`;
-  - the MMSC pushes `m-notification.ind` as a WAP Push over UDP port 2948;
+  - the MMSC pushes `m-notification.ind` as a WAP Push over UDP port 2948, or, as the original did, as SMS-DELIVER PDUs in hex text over TCP port 2950 (concatenated when the push does not fit one SMS);
   - phones retrieve the message by HTTP GET, either immediately or deferred (`m-notifyresp.ind`, `m-acknowledge.ind`);
   - delivery reports (`m-delivery.ind`) and read reports (`m-read-rec.ind` → `m-read-orig.ind`).
-- Works with real handsets: register a phone's number, IP address and push port.
+- Works with real handsets: register a phone's number, IP address, push transport (`udp` or `sms`) and port.
 - Has built-in simulated phones, each with its own window: compose (text, attachments, Cc/Bcc, report requests), inbox, deferred messages and reports.
 - Received parts can be saved to files, or opened in the system's default application.
 - Manual mode, as in the original: notifications are held until sent from the **Manual** tab, where every header can be edited or left out, to test how clients cope with odd or incomplete notifications.
