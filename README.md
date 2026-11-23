@@ -13,6 +13,7 @@ It started as a bachelor's thesis project idea. The original was written in 2008
   - delivery reports (`m-delivery.ind`) and read reports (`m-read-rec.ind` → `m-read-orig.ind`).
 - Works with real handsets: register a phone's number, IP address and push port.
 - Has built-in simulated phones, each with its own window: compose (text, attachments, Cc/Bcc, report requests), inbox, deferred messages and reports.
+- Received parts can be saved to files, or opened in the system's default application.
 - Hides Bcc recipients from the retrieved message.
 
 ## Running

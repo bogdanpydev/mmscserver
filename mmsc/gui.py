@@ -10,14 +10,16 @@ import dataclasses
 import json
 import mimetypes
 import queue
+import tempfile
 import threading
 import time
 import tkinter as tk
+import webbrowser
 from pathlib import Path
 from tkinter import filedialog, ttk
 
 from .pdu import Part, number_of
-from .phone import Phone
+from .phone import Phone, Received
 from .server import Config, Mmsc
 
 CONFIG_FILE = Path("mmsc.json")
@@ -37,6 +39,14 @@ def save_config(config: Config, path: Path, skip_phones=()) -> None:
     data = dataclasses.asdict(config)
     data["phones"] = {n: target for n, target in data["phones"].items() if n not in skip_phones}
     path.write_text(json.dumps(data, indent=2))
+
+
+def file_name(part: Part, index: int) -> str:
+    """A local file name for a received part: its own name without any directory, else part<index>.<ext>."""
+    name = Path(part.location or part.params.get("name") or part.params.get("filename") or "").name
+    if name in ("", ".."):
+        name = f"part{index}{mimetypes.guess_extension(part.content_type) or ''}"
+    return name
 
 
 def split_numbers(text: str) -> list[str]:
@@ -113,6 +123,7 @@ class App:
         self.mmsc = Mmsc(self.config, log=self.events.put)
         self.running = False
         self.phones: dict[str, PhoneWindow] = {}  # simulated phones by number
+        self.temp_dir = tempfile.TemporaryDirectory(prefix="mmsc-")  # parts opened for viewing
         root.title("MMSC Simulator")
         root.protocol("WM_DELETE_WINDOW", self.close)
         self._build_settings()
@@ -294,6 +305,7 @@ class App:
             self.background.run(self._shutdown(list(self.phones.values()))).result(timeout=5)
         finally:
             self.background.stop()
+            self.temp_dir.cleanup()
             self.root.destroy()
 
     async def _shutdown(self, windows: list["PhoneWindow"]) -> None:
@@ -309,6 +321,7 @@ class PhoneWindow:
         self.phone = Phone(number, app.mmsc.base_url if app.running else "",
                            log=lambda text: app.events.put(f"[{number}] {text}"))
         self.attachments: list[Part] = []
+        self.shown: Received | None = None  # the inbox message in the details view
         self.window = tk.Toplevel(app.root)
         self.window.title(f"Phone {number}")
         self.window.protocol("WM_DELETE_WINDOW", self.close)
@@ -345,7 +358,13 @@ class PhoneWindow:
         self.inbox.pack(fill="both", expand=True)
         self.inbox.bind("<<TreeviewSelect>>", lambda _: self.show_selected())
         self.details = scrolled_text(frame, height=10, width=60)
-        ttk.Button(frame, text="Send read report", command=self.send_read_report).pack(anchor="e")
+        self.parts = make_tree(frame, ("Part", "Type", "Size"), height=3)
+        self.parts.pack(fill="x")
+        buttons = ttk.Frame(frame)
+        buttons.pack(fill="x", pady=(4, 0))
+        ttk.Button(buttons, text="Save part…", command=self.save_parts).pack(side="left")
+        ttk.Button(buttons, text="Open part", command=self.open_parts).pack(side="left", padx=4)
+        ttk.Button(buttons, text="Send read report", command=self.send_read_report).pack(side="right")
         return frame
 
     def _build_pending(self, parent) -> ttk.Frame:
@@ -390,7 +409,9 @@ class PhoneWindow:
         selection = self.inbox.selection()
         if not selection:
             return
-        received = list(self.phone.inbox)[int(selection[0])]
+        received = self.shown = list(self.phone.inbox)[int(selection[0])]
+        fill(self.parts, {str(i): (file_name(part, i), part.content_type, len(part.data))
+                          for i, part in enumerate(received.parts)})
         lines = []
         for name, value in received.headers.items():
             if name == "Date":
@@ -403,6 +424,29 @@ class PhoneWindow:
             if part.content_type.startswith("text/"):
                 lines.append(part.text())
         set_text(self.details, "\n".join(lines))
+
+    def _selected_parts(self) -> list[tuple[str, Part]]:
+        return [(file_name(self.shown.parts[int(iid)], int(iid)), self.shown.parts[int(iid)])
+                for iid in self.parts.selection()]
+
+    def save_parts(self) -> None:
+        for name, part in self._selected_parts():
+            path = filedialog.asksaveasfilename(parent=self.window, initialfile=name)
+            if not path:
+                continue
+            try:
+                Path(path).write_bytes(part.data)
+            except OSError as exc:
+                self.phone.log(f"Cannot save {name}: {exc}")
+            else:
+                self.phone.log(f"Saved {name} to {path}")
+
+    def open_parts(self) -> None:
+        """Show the selected parts in the system's default application for their type."""
+        for name, part in self._selected_parts():
+            path = Path(tempfile.mkdtemp(dir=self.app.temp_dir.name)) / name
+            path.write_bytes(part.data)
+            webbrowser.open(path.as_uri())
 
     def send_read_report(self) -> None:
         for iid in self.inbox.selection():
