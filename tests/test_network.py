@@ -144,6 +144,34 @@ def test_recipient_can_forbid_the_delivery_report():
     asyncio.run(scenario())
 
 
+def test_manual_mode_holds_notifications_until_sent_with_edited_headers():
+    async def scenario():
+        async with network("100", "200", auto_retrieve=False) as (mmsc, phones, logs):
+            mmsc.config.manual = True
+            conf = await phones["100"].send(["200"], subject="original", text="ținut", delivery_report=True)
+            delivery = mmsc.messages[conf["Message-Id"]].deliveries[0]
+            await eventually(lambda: delivery.status == "held")
+            held = mmsc.held[delivery.transaction_id]
+            assert (held["Subject"], held["Message-Type"]) == ("original", "m-notification-ind")
+            assert f"{conf['Message-Id']}: notification for 200 held" in logs
+            assert phones["200"].pending == []
+
+            edited = held | {"Subject": "editat", "Message-Size": 1}
+            del edited["Expiry"]
+            mmsc.send_held(delivery.transaction_id, edited)
+            await eventually(lambda: phones["200"].pending and delivery.status == "deferred")
+            notification = phones["200"].pending[0]
+            assert (notification["Subject"], notification["Message-Size"]) == ("editat", 1)
+            assert "Expiry" not in notification
+
+            mmsc.send_held(delivery.transaction_id, edited)
+            assert f"No held notification {delivery.transaction_id}" in logs
+            await phones["200"].retrieve(notification)
+            await eventually(lambda: delivery.status == "retrieved")
+
+    asyncio.run(scenario())
+
+
 def test_message_without_recipients_is_refused():
     async def scenario():
         async with network("100") as (mmsc, phones, logs):

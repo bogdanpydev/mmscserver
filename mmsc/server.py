@@ -21,6 +21,7 @@ class Config:
     notify_delay: float = 2.0  # seconds between accepting a message and notifying recipients
     expiry: int = 2 * 24 * 3600
     mms_version: str = "1.2"
+    manual: bool = False  # hold notifications until send_held(), like the original's manual mode
     phones: dict[str, tuple[str, int]] = field(default_factory=dict)  # number -> (ip, push port)
 
 
@@ -48,6 +49,7 @@ class Mmsc:
         self.port = config.port
         self.messages: dict[str, Message] = {}
         self._deliveries: dict[str, tuple[Message, Delivery]] = {}  # by transaction id
+        self.held: dict[str, dict] = {}  # notification headers waiting in manual mode, by transaction id
         self._ids = itertools.count(1)
         self._timers: list[asyncio.TimerHandle] = []
         self._server: asyncio.Server | None = None
@@ -138,6 +140,20 @@ class Mmsc:
         }
         if "Subject" in message.headers:
             headers["Subject"] = message.headers["Subject"]
+        if self.config.manual:
+            self.held[delivery.transaction_id] = headers
+            delivery.status = "held"
+            self.log(f"{message.id}: notification for {delivery.recipient} held")
+            return
+        delivery.status = "notified"
+        self._push(delivery.recipient, headers)
+
+    def send_held(self, transaction_id: str, headers: dict) -> None:
+        """Push a held notification to its recipient, with headers as edited by the user."""
+        if self.held.pop(transaction_id, None) is None:
+            self.log(f"No held notification {transaction_id}")
+            return
+        _, delivery = self._deliveries[transaction_id]
         delivery.status = "notified"
         self._push(delivery.recipient, headers)
 

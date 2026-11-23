@@ -155,6 +155,41 @@ def test_retrieval_can_be_deferred_and_done_by_hand(app):
     pump(app, lambda: rows(app.messages)[0][4] == "retrieved")
 
 
+def test_manual_mode_holds_notifications_for_editing(app, tmp_path):
+    start(app)
+    sender, receiver = add_phone(app, "100"), add_phone(app, "200")
+    app.manual.set(True)
+    app.set_manual()
+    assert json.loads((tmp_path / "mmsc.json").read_text())["manual"] is True
+    app.send_held()
+    pump(app, lambda: "Select a held notification first" in log_text(app))
+
+    sender.to.set("200")
+    sender.subject.set("Salut")
+    sender.send()
+    pump(app, lambda: app.held.get_children())
+    assert rows(app.held) == [("mms-1-1", "100", "200", "Salut")]
+    assert rows(app.messages)[0][4] == "held"
+    app.held.selection_set("mms-1-1")
+    app.edit_selected()
+    fields = {name: variable.get() for name, variable in app.held_fields.items()}
+    assert fields == {"Transaction-Id": "mms-1-1", "MMS-Version": "1.2", "From": "100/TYPE=PLMN",
+                      "Subject": "Salut", "Message-Class": "personal", "Message-Size": fields["Message-Size"],
+                      "Expiry": "172800", "Content-Location": f"{app.mmsc.base_url}/mms/mms-1-1"}
+
+    app.held_fields["Expiry"].set("mâine")
+    app.send_held()
+    pump(app, lambda: "Invalid notification: Expiry must be a whole number, not 'mâine'" in log_text(app))
+    app.held_fields["Expiry"].set("60")
+    app.held_fields["Subject"].set("")
+    app.refresh()  # refreshes re-select the row; that must not reload the form over the edits
+    app.root.update()
+    assert app.held_fields["Expiry"].get() == "60"
+    app.send_held()
+    pump(app, lambda: receiver.inbox.get_children() and not app.held.get_children())
+    assert rows(app.messages)[0][4] == "retrieved"
+
+
 def test_real_phones_are_added_saved_and_removed(app, tmp_path):
     app.new_number.set("300")
     app.new_ip.set("10.0.0.3")
