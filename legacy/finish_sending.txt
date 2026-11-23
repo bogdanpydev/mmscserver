@@ -1,0 +1,9 @@
+HTTP/1.1 204 OK
+Date: Tue, 02 Sep 2008 16:28:40 GMT
+Server: Apache/2.0.54 (Debian GNU/Linux) mod_jk2/2.0.4 PHP/4.3.10-22 mod_ssl/2.0.54 OpenSSL/0.9.7e mod_perl/1.999.21 Perl/v5.8.4
+X-Powered-By: PHP/4.3.10-22
+Content-Length: 0          
+Keep-Alive: timeout=15, max=100
+Connection: Keep-Alive
+Content-Type: application/vnd.wap.mms-message
+
