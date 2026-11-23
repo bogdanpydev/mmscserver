@@ -18,9 +18,10 @@ import webbrowser
 from pathlib import Path
 from tkinter import filedialog, ttk
 
-from .pdu import MESSAGE_CLASSES, Part, number_of
+from .pdu import MESSAGE_CLASSES, PUSH_PORT, Part, number_of
 from .phone import Phone, Received
-from .server import Config, Mmsc
+from .server import Config, Mmsc, Target
+from .sms import SMS_PORT
 
 CONFIG_FILE = Path("mmsc.json")
 POLL_MS = 100
@@ -28,13 +29,14 @@ MMS_VERSIONS = ("1.0", "1.1", "1.2", "1.3")
 HELD_FIELDS = ("Transaction-Id", "MMS-Version", "From", "Subject", "Message-Class", "Message-Size", "Expiry",
                "Content-Location")
 NUMBER_FIELDS = ("Message-Size", "Expiry")
+PUSH_PORTS = {"udp": PUSH_PORT, "sms": SMS_PORT}  # default port of each push transport
 
 
 def load_config(path: Path) -> Config:
     if not path.exists():
         return Config()
     data = json.loads(path.read_text())
-    data["phones"] = {number: tuple(target) for number, target in data.get("phones", {}).items()}
+    data["phones"] = {number: Target(*target) for number, target in data.get("phones", {}).items()}
     return Config(**data)
 
 
@@ -203,20 +205,28 @@ class App:
 
     def _build_directory(self, parent) -> ttk.Frame:
         frame = ttk.Frame(parent, padding=8)
-        self.directory = make_tree(frame, ("Number", "IP", "Push port", "Kind"))
+        self.directory = make_tree(frame, ("Number", "IP", "Push port", "Push via", "Kind"))
         self.directory.pack(fill="both", expand=True)
         form = ttk.Frame(frame)
         form.pack(fill="x", pady=(8, 0))
         self.new_number = tk.StringVar(self.root)
         self.new_ip = tk.StringVar(self.root, value="127.0.0.1")
-        self.new_port = tk.StringVar(self.root, value="2948")
-        for column, (label, variable, width) in enumerate(
-                (("Number", self.new_number, 14), ("IP", self.new_ip, 14), ("Push port", self.new_port, 7))):
+        self.new_port = tk.StringVar(self.root, value=str(PUSH_PORT))
+        self.new_transport = tk.StringVar(self.root, value="udp")
+        transport = ttk.Combobox(form, textvariable=self.new_transport, values=list(PUSH_PORTS), width=5,
+                                 state="readonly")
+        transport.bind("<<ComboboxSelected>>", lambda _: self.transport_changed())
+        fields = [("Number", ttk.Entry(form, textvariable=self.new_number, width=14)),
+                  ("IP", ttk.Entry(form, textvariable=self.new_ip, width=14)),
+                  ("Push via", transport),
+                  ("Push port", ttk.Entry(form, textvariable=self.new_port, width=7))]
+        for column, (label, widget) in enumerate(fields):
             ttk.Label(form, text=label).grid(row=0, column=column, sticky="w", padx=4)
-            ttk.Entry(form, textvariable=variable, width=width).grid(row=1, column=column, padx=4)
-        ttk.Button(form, text="New simulated phone", command=self.add_simulated_phone).grid(row=1, column=3, padx=4)
-        ttk.Button(form, text="Add real phone", command=self.add_external_phone).grid(row=1, column=4, padx=4)
-        ttk.Button(form, text="Remove selected", command=self.remove_selected).grid(row=1, column=5, padx=4)
+            widget.grid(row=1, column=column, padx=4)
+        for column, (text, command) in enumerate((("New simulated phone", self.add_simulated_phone),
+                                                  ("Add real phone", self.add_external_phone),
+                                                  ("Remove selected", self.remove_selected)), len(fields)):
+            ttk.Button(form, text=text, command=command).grid(row=1, column=column, padx=4)
         return frame
 
     def _build_log(self, parent) -> ttk.Frame:
@@ -315,12 +325,16 @@ class App:
             return
         window = PhoneWindow(self, number)
         self.phones[number] = window
-        self.background.run(self._start_phone(window.phone))
+        self.background.run(self._start_phone(window.phone, self.new_transport.get()))
 
-    async def _start_phone(self, phone: Phone) -> None:
-        await phone.start()
-        self.config.phones[phone.number] = ("127.0.0.1", phone.port)
-        phone.log(f"Simulated phone waiting for push on UDP port {phone.port}")
+    async def _start_phone(self, phone: Phone, transport: str) -> None:
+        await phone.start(transport=transport)
+        self.config.phones[phone.number] = Target("127.0.0.1", phone.port, transport)
+        waiting = f"SMS on TCP port {phone.port}" if transport == "sms" else f"push on UDP port {phone.port}"
+        phone.log(f"Simulated phone waiting for {waiting}")
+
+    def transport_changed(self) -> None:
+        self.new_port.set(str(PUSH_PORTS[self.new_transport.get()]))
 
     def add_external_phone(self) -> None:
         number = self._new_number()
@@ -331,7 +345,7 @@ class App:
         except ValueError:
             self.events.put(f"Invalid push port {self.new_port.get()!r}")
             return
-        self.config.phones[number] = (self.new_ip.get().strip(), port)
+        self.config.phones[number] = Target(self.new_ip.get().strip(), port, self.new_transport.get())
         self.save()
         self.refresh()
 
@@ -373,8 +387,8 @@ class App:
             if delivery.status == "held"
         })
         fill(self.directory, {
-            number: (number, ip, port, "simulated" if number in self.phones else "real")
-            for number, (ip, port) in list(self.config.phones.items())
+            number: (number, *target, "simulated" if number in self.phones else "real")
+            for number, target in list(self.config.phones.items())
         })
         for window in self.phones.values():
             window.refresh()

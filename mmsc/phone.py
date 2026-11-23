@@ -8,6 +8,7 @@ from dataclasses import dataclass
 
 from . import minihttp
 from .pdu import Part, Pdu, PduError, decode, decode_content, encode, encode_content, plmn, push_unwrap
+from .sms import decode_sms
 
 MMS_VERSION = "1.2"
 
@@ -37,10 +38,17 @@ class Phone:
         self.reports: list[dict] = []  # delivery and read reports
         self.port = 0
         self._transport: asyncio.DatagramTransport | None = None
+        self._server: asyncio.Server | None = None
+        self._segments: dict[int, dict[int, bytes]] = {}  # SMS segments by reference, then number
         self._transaction_ids = itertools.count(1)
         self._tasks: set[asyncio.Task] = set()
 
-    async def start(self, host: str = "127.0.0.1", port: int = 0) -> None:
+    async def start(self, host: str = "127.0.0.1", port: int = 0, transport: str = "udp") -> None:
+        """Listen for pushes: WAP push datagrams over UDP, or SMS PDUs over TCP ("sms")."""
+        if transport == "sms":
+            self._server = await asyncio.start_server(self._on_sms, host, port)
+            self.port = self._server.sockets[0].getsockname()[1]
+            return
         loop = asyncio.get_running_loop()
         listener = _PushListener(self._on_push)
         self._transport, _ = await loop.create_datagram_endpoint(lambda: listener, local_addr=(host, port))
@@ -51,6 +59,8 @@ class Phone:
             task.cancel()
         if self._transport:
             self._transport.close()
+        if self._server:
+            self._server.close()
 
     async def send(self, to: list[str], subject: str = "", text: str = "", attachments: list[Part] = (),
                    cc: list[str] = (), bcc: list[str] = (), delivery_report: bool = False,
@@ -103,6 +113,21 @@ class Phone:
 
     async def _post(self, headers: dict) -> None:
         await minihttp.request(self.mmsc_url, encode(Pdu(headers)))
+
+    async def _on_sms(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        """One SMS PDU per connection, as hex text; a push split over several SMS is put back together."""
+        text = (await reader.read()).decode("ascii", "replace")
+        writer.close()
+        try:
+            segment = decode_sms(text)
+        except PduError as exc:
+            self.log(f"Bad SMS: {exc}")
+            return
+        received = self._segments.setdefault(segment.reference, {})
+        received[segment.number] = segment.data
+        if len(received) == segment.count:
+            del self._segments[segment.reference]
+            self._on_push(b"".join(received[n] for n in sorted(received)))
 
     def _on_push(self, data: bytes) -> None:
         try:

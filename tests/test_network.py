@@ -10,7 +10,8 @@ import pytest
 from mmsc import minihttp
 from mmsc.pdu import Part, Pdu, encode, encode_long, encode_text, encode_uintvar, push_wrap, with_length
 from mmsc.phone import Phone
-from mmsc.server import Config, Mmsc
+from mmsc.server import Config, Mmsc, Target
+from mmsc.sms import encode_sms
 
 PNG = b"\x89PNG\r\n\x1a\n" + bytes(range(256))
 
@@ -24,15 +25,15 @@ async def eventually(predicate, timeout: float = 3.0) -> None:
 
 
 @contextlib.asynccontextmanager
-async def network(*numbers: str, auto_retrieve: bool = True):
+async def network(*numbers: str, auto_retrieve: bool = True, transport: str = "udp"):
     logs: list[str] = []
     mmsc = Mmsc(Config(host="127.0.0.1", port=0, notify_delay=0), log=logs.append)
     await mmsc.start()
     phones = {}
     for number in numbers:
         phone = Phone(number, mmsc.base_url, log=logs.append, auto_retrieve=auto_retrieve)
-        await phone.start()
-        mmsc.config.phones[number] = ("127.0.0.1", phone.port)
+        await phone.start(transport=transport)
+        mmsc.config.phones[number] = Target("127.0.0.1", phone.port, transport)
         phones[number] = phone
     try:
         yield mmsc, phones, logs
@@ -331,6 +332,55 @@ def test_phone_logs_bad_pushes_and_failed_retrievals():
             assert "Bad push: not a WSP Push PDU (type 0x07)" in logs
             assert "Bad push: truncated WSP Push PDU" in logs
             assert "Bad push: malformed MMS PDU near byte 1" in logs
+
+    asyncio.run(scenario())
+
+
+def test_notifications_and_reports_travel_by_sms_split_when_too_long():
+    async def scenario():
+        async with network("100", "200", transport="sms") as (mmsc, phones, logs):
+            subject = "Un subiect lung, ca notificarea să nu încapă într-un singur SMS de 140 de octeți"
+            conf = await phones["100"].send(["200"], subject=subject, text="prin SMS", delivery_report=True)
+            await eventually(lambda: phones["100"].reports)
+            assert phones["200"].inbox[0].headers["Subject"] == subject
+            assert phones["100"].reports[0]["Status"] == "retrieved"
+            assert "m-notification-ind -> 200 in 2 SMS" in logs
+            assert "m-delivery-ind -> 100 in 1 SMS" in logs
+            assert mmsc.messages[conf["Message-Id"]].deliveries[0].status == "retrieved"
+
+    asyncio.run(scenario())
+
+
+def test_sms_that_cannot_be_delivered_is_logged():
+    async def scenario():
+        async with network("100") as (mmsc, phones, logs):
+            with socket.socket() as closed:
+                closed.bind(("127.0.0.1", 0))
+                mmsc.config.phones["200"] = Target("127.0.0.1", closed.getsockname()[1], "sms")
+            await phones["100"].send(["200"], text="nimeni nu ascultă")
+            await eventually(lambda: any(line.startswith("Cannot send") for line in logs))
+            assert any(line.startswith("Cannot send m-notification-ind to 200 by SMS") for line in logs)
+
+    asyncio.run(scenario())
+
+
+def test_phone_logs_bad_sms():
+    not_for_wap = encode_sms(b"push", 1)[0].replace("0B84", "0B85")  # destination port 2949
+    stray_segment = encode_sms(bytes(200), 7)[0]  # first of two; the second never comes
+
+    async def scenario():
+        async with network("200", transport="sms") as (_, phones, logs):
+            for text in ("zz", "00", "0001", not_for_wap, stray_segment):
+                _, writer = await asyncio.open_connection("127.0.0.1", phones["200"].port)
+                writer.write(text.encode())
+                writer.close()
+                await writer.wait_closed()
+            bad = lambda: [line.removeprefix("Bad SMS: ") for line in logs if line.startswith("Bad SMS")]  # noqa: E731
+            await eventually(lambda: len(bad()) == 4)
+            assert bad()[0].startswith("SMS PDU is not hex text")
+            assert bad()[1:] == ["truncated SMS PDU", "not an SMS-DELIVER with a user data header",
+                                 "SMS is not addressed to the WAP push port"]
+            assert phones["200"].reports == [] and phones["200"].inbox == []
 
     asyncio.run(scenario())
 
