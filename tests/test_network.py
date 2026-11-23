@@ -10,7 +10,8 @@ import pytest
 from mmsc import minihttp
 from mmsc.pdu import Part, Pdu, encode, encode_long, encode_text, encode_uintvar, push_wrap, with_length
 from mmsc.phone import Phone
-from mmsc.server import Config, Mmsc
+from mmsc.server import Config, Mmsc, Target
+from mmsc.sms import encode_sms
 
 PNG = b"\x89PNG\r\n\x1a\n" + bytes(range(256))
 
@@ -24,15 +25,15 @@ async def eventually(predicate, timeout: float = 3.0) -> None:
 
 
 @contextlib.asynccontextmanager
-async def network(*numbers: str, auto_retrieve: bool = True):
+async def network(*numbers: str, auto_retrieve: bool = True, transport: str = "udp"):
     logs: list[str] = []
     mmsc = Mmsc(Config(host="127.0.0.1", port=0, notify_delay=0), log=logs.append)
     await mmsc.start()
     phones = {}
     for number in numbers:
         phone = Phone(number, mmsc.base_url, log=logs.append, auto_retrieve=auto_retrieve)
-        await phone.start()
-        mmsc.config.phones[number] = ("127.0.0.1", phone.port)
+        await phone.start(transport=transport)
+        mmsc.config.phones[number] = Target("127.0.0.1", phone.port, transport)
         phones[number] = phone
     try:
         yield mmsc, phones, logs
@@ -140,6 +141,34 @@ def test_recipient_can_forbid_the_delivery_report():
             await minihttp.request(mmsc.base_url, encode(acknowledge))
             assert mmsc.messages[conf["Message-Id"]].deliveries[0].status == "retrieved"
             assert logs.count("m-delivery-ind -> 100") == 1
+
+    asyncio.run(scenario())
+
+
+def test_manual_mode_holds_notifications_until_sent_with_edited_headers():
+    async def scenario():
+        async with network("100", "200", auto_retrieve=False) as (mmsc, phones, logs):
+            mmsc.config.manual = True
+            conf = await phones["100"].send(["200"], subject="original", text="ținut", delivery_report=True)
+            delivery = mmsc.messages[conf["Message-Id"]].deliveries[0]
+            await eventually(lambda: delivery.status == "held")
+            held = mmsc.held[delivery.transaction_id]
+            assert (held["Subject"], held["Message-Type"]) == ("original", "m-notification-ind")
+            assert f"{conf['Message-Id']}: notification for 200 held" in logs
+            assert phones["200"].pending == []
+
+            edited = held | {"Subject": "editat", "Message-Size": 1}
+            del edited["Expiry"]
+            mmsc.send_held(delivery.transaction_id, edited)
+            await eventually(lambda: phones["200"].pending and delivery.status == "deferred")
+            notification = phones["200"].pending[0]
+            assert (notification["Subject"], notification["Message-Size"]) == ("editat", 1)
+            assert "Expiry" not in notification
+
+            mmsc.send_held(delivery.transaction_id, edited)
+            assert f"No held notification {delivery.transaction_id}" in logs
+            await phones["200"].retrieve(notification)
+            await eventually(lambda: delivery.status == "retrieved")
 
     asyncio.run(scenario())
 
@@ -303,6 +332,69 @@ def test_phone_logs_bad_pushes_and_failed_retrievals():
             assert "Bad push: not a WSP Push PDU (type 0x07)" in logs
             assert "Bad push: truncated WSP Push PDU" in logs
             assert "Bad push: malformed MMS PDU near byte 1" in logs
+
+    asyncio.run(scenario())
+
+
+def test_notifications_and_reports_travel_by_sms_split_when_too_long():
+    async def scenario():
+        async with network("100", "200", transport="sms") as (mmsc, phones, logs):
+            subject = "Un subiect lung, ca notificarea să nu încapă într-un singur SMS de 140 de octeți"
+            conf = await phones["100"].send(["200"], subject=subject, text="prin SMS", delivery_report=True)
+            await eventually(lambda: phones["100"].reports)
+            assert phones["200"].inbox[0].headers["Subject"] == subject
+            assert phones["100"].reports[0]["Status"] == "retrieved"
+            assert "m-notification-ind -> 200 in 2 SMS" in logs
+            assert "m-delivery-ind -> 100 in 1 SMS" in logs
+            assert mmsc.messages[conf["Message-Id"]].deliveries[0].status == "retrieved"
+
+    asyncio.run(scenario())
+
+
+def test_sms_that_cannot_be_delivered_is_logged():
+    async def scenario():
+        async with network("100") as (mmsc, phones, logs):
+            with socket.socket() as closed:
+                closed.bind(("127.0.0.1", 0))
+                mmsc.config.phones["200"] = Target("127.0.0.1", closed.getsockname()[1], "sms")
+            await phones["100"].send(["200"], text="nimeni nu ascultă")
+            await eventually(lambda: any(line.startswith("Cannot send") for line in logs))
+            assert any(line.startswith("Cannot send m-notification-ind to 200 by SMS") for line in logs)
+
+    asyncio.run(scenario())
+
+
+def test_phone_logs_bad_sms(monkeypatch):
+    monkeypatch.setattr(minihttp, "TIMEOUT", 0.1)
+    good = encode_sms(b"push", 1)[0]
+    first_of_two = encode_sms(bytes(200), 7)[0]
+    cases = {
+        "zz": "SMS PDU is not hex text",
+        "00": "truncated SMS PDU",
+        "0001": "not an SMS-DELIVER with a user data header",
+        good[:-2]: "truncated SMS PDU",  # shorter than its user data length
+        good.replace("060504", "060506", 1): "truncated SMS PDU",  # header element longer than the header
+        good.replace("0B84", "0B85"): "SMS is not addressed to the WAP push port",  # port 2949
+        first_of_two.replace("0804000702", "0804000700"): "SMS segment 1 of 0",
+        None: "timed out",  # connects and sends nothing
+    }
+
+    async def scenario():
+        async with network("200", transport="sms") as (_, phones, logs):
+            bad = lambda: [line.removeprefix("Bad SMS: ") for line in logs if line.startswith("Bad SMS")]  # noqa: E731
+            for count, (text, error) in enumerate(cases.items(), 1):
+                _, writer = await asyncio.open_connection("127.0.0.1", phones["200"].port)
+                if text is not None:
+                    writer.write(text.encode())
+                    writer.close()
+                await eventually(lambda: len(bad()) == count)
+                assert bad()[-1].startswith(error)
+                writer.close()
+            _, writer = await asyncio.open_connection("127.0.0.1", phones["200"].port)
+            writer.write(first_of_two.encode())  # the second segment never comes
+            writer.close()
+            await asyncio.sleep(0.05)
+            assert phones["200"].reports == [] and phones["200"].inbox == []
 
     asyncio.run(scenario())
 

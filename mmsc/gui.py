@@ -18,20 +18,25 @@ import webbrowser
 from pathlib import Path
 from tkinter import filedialog, ttk
 
-from .pdu import Part, number_of
+from .pdu import MESSAGE_CLASSES, PUSH_PORT, Part, number_of
 from .phone import Phone, Received
-from .server import Config, Mmsc
+from .server import Config, Mmsc, Target
+from .sms import SMS_PORT
 
 CONFIG_FILE = Path("mmsc.json")
 POLL_MS = 100
 MMS_VERSIONS = ("1.0", "1.1", "1.2", "1.3")
+HELD_FIELDS = ("Transaction-Id", "MMS-Version", "From", "Subject", "Message-Class", "Message-Size", "Expiry",
+               "Content-Location")
+NUMBER_FIELDS = ("Message-Size", "Expiry")
+PUSH_PORTS = {"udp": PUSH_PORT, "sms": SMS_PORT}  # default port of each push transport
 
 
 def load_config(path: Path) -> Config:
     if not path.exists():
         return Config()
     data = json.loads(path.read_text())
-    data["phones"] = {number: tuple(target) for number, target in data.get("phones", {}).items()}
+    data["phones"] = {number: Target(*target) for number, target in data.get("phones", {}).items()}
     return Config(**data)
 
 
@@ -103,6 +108,12 @@ class Background:
         future.add_done_callback(self._done)
         return future
 
+    def call(self, function, *args):
+        """Run a plain function on the loop's thread, reporting failures like run()."""
+        async def call():
+            return function(*args)
+        return self.run(call())
+
     def _done(self, future) -> None:
         if not future.cancelled() and future.exception():
             self._on_error(f"Error: {future.exception()}")
@@ -130,6 +141,7 @@ class App:
         tabs = ttk.Notebook(root)
         tabs.pack(fill="both", expand=True, padx=8, pady=(0, 8))
         tabs.add(self._build_messages(tabs), text="Messages")
+        tabs.add(self._build_held(tabs), text="Manual")
         tabs.add(self._build_directory(tabs), text="Phones")
         tabs.add(self._build_log(tabs), text="Log")
         self.refresh()
@@ -165,22 +177,56 @@ class App:
         self.messages.pack(fill="both", expand=True)
         return frame
 
+    def _build_held(self, parent) -> ttk.Frame:
+        frame = ttk.Frame(parent, padding=8)
+        self.manual = tk.BooleanVar(self.root, value=self.config.manual)
+        ttk.Checkbutton(frame, text="Manual mode: hold notifications until sent from here", variable=self.manual,
+                        command=self.set_manual).pack(anchor="w")
+        self.held = make_tree(frame, ("Transaction", "From", "To", "Subject"), height=4)
+        self.held.pack(fill="both", expand=True, pady=4)
+        self.held.bind("<<TreeviewSelect>>", lambda _: self.edit_selected())
+        self.editing: str | None = None  # transaction id of the notification in the form
+        form = ttk.LabelFrame(frame, text="Notification (an empty field leaves the header out)", padding=8)
+        form.pack(fill="x")
+        self.held_fields = {name: tk.StringVar(self.root) for name in HELD_FIELDS}
+        for index, (name, variable) in enumerate(self.held_fields.items()):
+            if name == "MMS-Version":
+                widget = ttk.Combobox(form, textvariable=variable, values=MMS_VERSIONS, width=5, state="readonly")
+            elif name == "Message-Class":
+                widget = ttk.Combobox(form, textvariable=variable, values=("", *MESSAGE_CLASSES), width=14,
+                                      state="readonly")
+            else:
+                widget = ttk.Entry(form, textvariable=variable, width=32)
+            row, column = divmod(index, 2)
+            ttk.Label(form, text=name).grid(row=row, column=2 * column, sticky="w", padx=4, pady=2)
+            widget.grid(row=row, column=2 * column + 1, sticky="w", padx=4, pady=2)
+        ttk.Button(frame, text="Send notification", command=self.send_held).pack(anchor="e", pady=(4, 0))
+        return frame
+
     def _build_directory(self, parent) -> ttk.Frame:
         frame = ttk.Frame(parent, padding=8)
-        self.directory = make_tree(frame, ("Number", "IP", "Push port", "Kind"))
+        self.directory = make_tree(frame, ("Number", "IP", "Push port", "Push via", "Kind"))
         self.directory.pack(fill="both", expand=True)
         form = ttk.Frame(frame)
         form.pack(fill="x", pady=(8, 0))
         self.new_number = tk.StringVar(self.root)
         self.new_ip = tk.StringVar(self.root, value="127.0.0.1")
-        self.new_port = tk.StringVar(self.root, value="2948")
-        for column, (label, variable, width) in enumerate(
-                (("Number", self.new_number, 14), ("IP", self.new_ip, 14), ("Push port", self.new_port, 7))):
+        self.new_port = tk.StringVar(self.root, value=str(PUSH_PORT))
+        self.new_transport = tk.StringVar(self.root, value="udp")
+        transport = ttk.Combobox(form, textvariable=self.new_transport, values=list(PUSH_PORTS), width=5,
+                                 state="readonly")
+        transport.bind("<<ComboboxSelected>>", lambda _: self.transport_changed())
+        fields = [("Number", ttk.Entry(form, textvariable=self.new_number, width=14)),
+                  ("IP", ttk.Entry(form, textvariable=self.new_ip, width=14)),
+                  ("Push via", transport),
+                  ("Push port", ttk.Entry(form, textvariable=self.new_port, width=7))]
+        for column, (label, widget) in enumerate(fields):
             ttk.Label(form, text=label).grid(row=0, column=column, sticky="w", padx=4)
-            ttk.Entry(form, textvariable=variable, width=width).grid(row=1, column=column, padx=4)
-        ttk.Button(form, text="New simulated phone", command=self.add_simulated_phone).grid(row=1, column=3, padx=4)
-        ttk.Button(form, text="Add real phone", command=self.add_external_phone).grid(row=1, column=4, padx=4)
-        ttk.Button(form, text="Remove selected", command=self.remove_selected).grid(row=1, column=5, padx=4)
+            widget.grid(row=1, column=column, padx=4)
+        for column, (text, command) in enumerate((("New simulated phone", self.add_simulated_phone),
+                                                  ("Add real phone", self.add_external_phone),
+                                                  ("Remove selected", self.remove_selected)), len(fields)):
+            ttk.Button(form, text=text, command=command).grid(row=1, column=column, padx=4)
         return frame
 
     def _build_log(self, parent) -> ttk.Frame:
@@ -226,6 +272,44 @@ class App:
     def save(self) -> None:
         save_config(self.config, self.config_path, skip_phones=set(self.phones))
 
+    # --- manual mode --------------------------------------------------------
+
+    def set_manual(self) -> None:
+        self.config.manual = self.manual.get()
+        self.save()
+
+    def edit_selected(self) -> None:
+        """Load the selected held notification into the form, unless it is already there."""
+        selection = self.held.selection()
+        if not selection or selection[0] == self.editing or selection[0] not in self.mmsc.held:
+            return
+        self.editing = selection[0]
+        headers = self.mmsc.held[self.editing]
+        for name, variable in self.held_fields.items():
+            variable.set(headers.get(name, ""))
+
+    def send_held(self) -> None:
+        if self.editing is None:
+            self.events.put("Select a held notification first")
+            return
+        try:
+            headers = self._edited_notification()
+        except ValueError as exc:
+            self.events.put(f"Invalid notification: {exc}")
+            return
+        self.background.call(self.mmsc.send_held, self.editing, headers)
+
+    def _edited_notification(self) -> dict:
+        headers = {"Message-Type": "m-notification-ind"}
+        for name, variable in self.held_fields.items():
+            value = variable.get().strip()
+            if not value:
+                continue  # an empty field leaves the header out
+            if name in NUMBER_FIELDS and not value.isdigit():
+                raise ValueError(f"{name} must be a whole number, not {value!r}")
+            headers[name] = int(value) if name in NUMBER_FIELDS else value
+        return headers
+
     # --- phone list ---------------------------------------------------------
 
     def _new_number(self) -> str | None:
@@ -241,12 +325,16 @@ class App:
             return
         window = PhoneWindow(self, number)
         self.phones[number] = window
-        self.background.run(self._start_phone(window.phone))
+        self.background.run(self._start_phone(window.phone, self.new_transport.get()))
 
-    async def _start_phone(self, phone: Phone) -> None:
-        await phone.start()
-        self.config.phones[phone.number] = ("127.0.0.1", phone.port)
-        phone.log(f"Simulated phone waiting for push on UDP port {phone.port}")
+    async def _start_phone(self, phone: Phone, transport: str) -> None:
+        await phone.start(transport=transport)
+        self.config.phones[phone.number] = Target("127.0.0.1", phone.port, transport)
+        waiting = f"SMS on TCP port {phone.port}" if transport == "sms" else f"push on UDP port {phone.port}"
+        phone.log(f"Simulated phone waiting for {waiting}")
+
+    def transport_changed(self) -> None:
+        self.new_port.set(str(PUSH_PORTS[self.new_transport.get()]))
 
     def add_external_phone(self) -> None:
         number = self._new_number()
@@ -257,7 +345,7 @@ class App:
         except ValueError:
             self.events.put(f"Invalid push port {self.new_port.get()!r}")
             return
-        self.config.phones[number] = (self.new_ip.get().strip(), port)
+        self.config.phones[number] = Target(self.new_ip.get().strip(), port, self.new_transport.get())
         self.save()
         self.refresh()
 
@@ -292,9 +380,15 @@ class App:
                                                    message.headers.get("Subject", ""), delivery.status)
             for message in list(self.mmsc.messages.values()) for delivery in list(message.deliveries)
         })
+        fill(self.held, {
+            delivery.transaction_id: (delivery.transaction_id, message.sender, delivery.recipient,
+                                      message.headers.get("Subject", ""))
+            for message in list(self.mmsc.messages.values()) for delivery in list(message.deliveries)
+            if delivery.status == "held"
+        })
         fill(self.directory, {
-            number: (number, ip, port, "simulated" if number in self.phones else "real")
-            for number, (ip, port) in list(self.config.phones.items())
+            number: (number, *target, "simulated" if number in self.phones else "real")
+            for number, target in list(self.config.phones.items())
         })
         for window in self.phones.values():
             window.refresh()
