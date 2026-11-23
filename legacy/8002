@@ -1,0 +1,9 @@
+GET / HTTP/1.1
+Host: 192.168.1.2:8002
+Connection: Keep-Alive
+Content-Type: application/vnd.wap.mms-message
+User-Agent: jMMS-Elips-1.1
+Accept-Charset: iso-8859-1, utf-8
+x-wap-profile: http://203.197.173.36/jBrowser/jBrowser4Win.rdf
+Accept: multipart/related, multipart/mixed, application/vnd.wap.multipart.related, application/vnd.wap.multipart.mixed, application/vnd.wap.multipart.alternative, application/smil, text/plain, text/x-imelody, audio/iMelody, image/bmp, image/wbmp, image/vnd.wap.wbmp, image/jpeg, image/jpg, image/png, image/gif, audio/wav, audio/wave, audio/x-wav, audio/x-wave, audio/mid, audio/midi, audio/sp-midi, audio/amr, audio/mp3, video/mpeg4, video/3gpp, application/vnd.wap.mms-message
+
