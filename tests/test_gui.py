@@ -5,11 +5,14 @@ import json
 import socket
 import time
 import tkinter as tk
+import webbrowser
+from pathlib import Path
 from tkinter import filedialog
 
 import pytest
 
-from mmsc.gui import App
+from mmsc.gui import App, file_name
+from mmsc.pdu import Part
 
 
 def new_root() -> tk.Tk:
@@ -97,6 +100,43 @@ def test_phones_exchange_an_mms_with_attachment_and_reports(app, tmp_path, monke
 
     sender.clear_attachments()
     assert sender.attachment_label.cget("text") == "No attachments"
+
+
+def test_received_parts_can_be_saved_and_opened(app, tmp_path, monkeypatch):
+    start(app)
+    sender, receiver = add_phone(app, "100"), add_phone(app, "200")
+    sender.attachments += [Part("image/png", b"\x89PNG", {}, "../poza.png"), Part("image/gif", b"GIF89a")]
+    sender.to.set("200")
+    sender.text.insert("1.0", "uite")
+    sender.send()
+    pump(app, lambda: receiver.inbox.get_children())
+    receiver.inbox.selection_set("0")
+    receiver.show_selected()
+    assert rows(receiver.parts) == [("text.txt", "text/plain", "4"), ("poza.png", "image/png", "4"),
+                                    ("part2.gif", "image/gif", "6")]
+
+    answers = iter([str(tmp_path / "saved.png"), "", str(tmp_path)])  # a file, cancel, a directory
+    monkeypatch.setattr(filedialog, "asksaveasfilename", lambda **_: next(answers))
+    receiver.parts.selection_set("1")
+    receiver.save_parts()
+    assert (tmp_path / "saved.png").read_bytes() == b"\x89PNG"
+    receiver.save_parts()
+    receiver.save_parts()
+    pump(app, lambda: "Cannot save poza.png" in log_text(app))
+    assert f"[200] Saved poza.png to {tmp_path / 'saved.png'}" in log_text(app)
+
+    opened = []
+    monkeypatch.setattr(webbrowser, "open", opened.append)
+    receiver.parts.selection_set(["0", "2"])
+    receiver.open_parts()
+    assert [Path(uri.removeprefix("file://")).read_bytes() for uri in opened] == [b"uite", b"GIF89a"]
+    assert [uri.rsplit("/", 1)[1] for uri in opened] == ["text.txt", "part2.gif"]
+
+
+def test_part_file_names_never_leave_the_target_directory():
+    assert file_name(Part("image/jpeg", b"", {"name": "dir/../poza.jpg"}), 1) == "poza.jpg"
+    assert file_name(Part("image/jpeg", b"", {}, ".."), 2) == "part2.jpg"
+    assert file_name(Part("application/x-unknown", b""), 3) == "part3"
 
 
 def test_retrieval_can_be_deferred_and_done_by_hand(app):
