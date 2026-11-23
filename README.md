@@ -14,6 +14,7 @@ It started as a bachelor's thesis project idea. The original was written in 2008
 - Works with real handsets: register a phone's number, IP address and push port.
 - Has built-in simulated phones, each with its own window: compose (text, attachments, Cc/Bcc, report requests), inbox, deferred messages and reports.
 - Received parts can be saved to files, or opened in the system's default application.
+- Manual mode, as in the original: notifications are held until sent from the **Manual** tab, where every header can be edited or left out, to test how clients cope with odd or incomplete notifications.
 - Hides Bcc recipients from the retrieved message.
 
 ## Running
